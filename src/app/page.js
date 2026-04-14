@@ -1,17 +1,29 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Dropzone from '@/components/Dropzone';
 import AspectControls from '@/components/AspectControls';
 import TimingControls from '@/components/TimingControls';
 import FrameGrid from '@/components/FrameGrid';
 import VideoPlayer from '@/components/VideoPlayer';
 import GifPanel from '@/components/GifPanel';
+import { renderVideo, renderGif, getFfmpeg } from '@/lib/ffmpegClient';
 
 const DEFAULT_DURATION = 2;
 
+let uid = 0;
+const nextId = () => `f${Date.now().toString(36)}${(uid++).toString(36)}`;
+
+function loadDims(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => resolve({ width: 0, height: 0 });
+    img.src = url;
+  });
+}
+
 export default function Page() {
-  const [jobId, setJobId] = useState(null);
   const [frames, setFrames] = useState([]);
   const [timingMode, setTimingMode] = useState('uniform');
   const [uniformDuration, setUniformDuration] = useState(DEFAULT_DURATION);
@@ -21,84 +33,129 @@ export default function Page() {
   const [videoUrl, setVideoUrl] = useState(null);
   const [gifUrl, setGifUrl] = useState(null);
   const [status, setStatus] = useState('idle');
+  const [progress, setProgress] = useState('');
   const [error, setError] = useState(null);
+  const logBuf = useRef([]);
+
+  useEffect(() => {
+    // Revoke object URLs on unmount
+    return () => {
+      for (const f of frames) URL.revokeObjectURL(f.previewUrl);
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      if (gifUrl) URL.revokeObjectURL(gifUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleFiles(files) {
-    setStatus('uploading');
     setError(null);
-    try {
-      const form = new FormData();
-      if (jobId) form.append('jobId', jobId);
-      for (const f of files) form.append('file', f);
-      const res = await fetch('/api/upload', { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'upload failed');
-      setJobId(data.jobId);
-      const withDur = data.frames.map((f) => ({ ...f, duration: uniformDuration }));
-      setFrames((prev) => [...prev, ...withDur]);
-      setStatus('idle');
-    } catch (err) {
-      setError(err.message);
-      setStatus('idle');
+    const added = [];
+    for (const file of files) {
+      const previewUrl = URL.createObjectURL(file);
+      const { width, height } = await loadDims(previewUrl);
+      added.push({
+        id: nextId(),
+        file,
+        previewUrl,
+        originalName: file.name,
+        width,
+        height,
+        duration: uniformDuration,
+      });
     }
+    setFrames((prev) => [...prev, ...added]);
   }
 
   function removeFrame(id) {
-    setFrames((prev) => prev.filter((f) => f.id !== id));
+    setFrames((prev) => {
+      const victim = prev.find((f) => f.id === id);
+      if (victim) URL.revokeObjectURL(victim.previewUrl);
+      return prev.filter((f) => f.id !== id);
+    });
   }
 
   function updateDuration(id, duration) {
     setFrames((prev) => prev.map((f) => (f.id === id ? { ...f, duration } : f)));
   }
 
-  async function renderVideo() {
-    if (!jobId || frames.length === 0) return;
-    setStatus('rendering');
-    setError(null);
-    setGifUrl(null);
-    try {
-      const res = await fetch('/api/render', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId,
-          frames: frames.map((f) => ({ id: f.id, duration: f.duration })),
-          timingMode,
-          uniformDuration,
-          fps,
-          crossfade,
-          aspect,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'render failed');
-      setVideoUrl(data.videoUrl);
-      setStatus('done');
-    } catch (err) {
-      setError(err.message);
-      setStatus('idle');
+  function onLog(message) {
+    logBuf.current.push(message);
+    if (logBuf.current.length > 200) logBuf.current.shift();
+    // Surface the last significant line as progress text
+    if (/frame=|time=|Output #|Stream #/.test(message)) {
+      setProgress(message.slice(0, 140));
     }
   }
 
-  const canRender = frames.length >= 1 && status !== 'rendering' && status !== 'uploading';
-  const busy = status === 'rendering' || status === 'uploading';
+  async function handleRenderVideo() {
+    if (frames.length === 0) return;
+    setStatus('rendering');
+    setProgress('Loading ffmpeg…');
+    setError(null);
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    if (gifUrl) URL.revokeObjectURL(gifUrl);
+    setVideoUrl(null);
+    setGifUrl(null);
+    try {
+      const { url } = await renderVideo(
+        { frames, timingMode, uniformDuration, fps, crossfade, aspect },
+        onLog,
+      );
+      setVideoUrl(url);
+      setProgress('');
+      setStatus('done');
+    } catch (err) {
+      console.error(err);
+      setError(err.message || 'render failed');
+      setStatus('idle');
+      setProgress('');
+    }
+  }
+
+  async function handleRenderGif(width, gifFps) {
+    setStatus('rendering-gif');
+    setProgress('Rendering GIF…');
+    setError(null);
+    if (gifUrl) URL.revokeObjectURL(gifUrl);
+    setGifUrl(null);
+    try {
+      const { url } = await renderGif({ width, fps: gifFps }, onLog);
+      setGifUrl(url);
+      setProgress('');
+      setStatus('done');
+      return url;
+    } catch (err) {
+      console.error(err);
+      setError(err.message || 'gif failed');
+      setStatus('idle');
+      setProgress('');
+      throw err;
+    }
+  }
+
+  const canRender = frames.length >= 1 && status === 'idle';
+  const busy = status === 'rendering' || status === 'rendering-gif';
+
+  // Preload ffmpeg on first interaction so first render isn't as slow
+  function warmFfmpeg() {
+    getFfmpeg(onLog).catch(() => {});
+  }
 
   return (
     <main className="min-h-screen bg-neutral-950 text-neutral-100">
       <div className="max-w-6xl mx-auto px-4 py-8 space-y-6">
         <header className="flex items-end justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-semibold">Image → Video (9:16)</h1>
+            <h1 className="text-2xl font-semibold">Image → Video</h1>
             <p className="text-sm text-neutral-400 mt-1">
-              Upload images, arrange them, and encode a vertical video. Optional GIF export.
+              Upload images, arrange them, encode a video in your browser. Nothing leaves your device.
             </p>
           </div>
-          {jobId && (
-            <div className="text-xs text-neutral-500 font-mono">job {jobId}</div>
-          )}
         </header>
 
-        <Dropzone onFiles={handleFiles} disabled={busy} />
+        <div onMouseEnter={warmFfmpeg}>
+          <Dropzone onFiles={handleFiles} disabled={busy} />
+        </div>
 
         <AspectControls aspect={aspect} setAspect={setAspect} />
 
@@ -116,14 +173,16 @@ export default function Page() {
         <div className="flex flex-wrap items-center gap-3">
           <button
             type="button"
-            onClick={renderVideo}
+            onClick={handleRenderVideo}
             disabled={!canRender}
             className="rounded-md bg-indigo-500 hover:bg-indigo-600 text-white px-5 py-2.5 text-sm font-medium disabled:opacity-50"
           >
             {status === 'rendering' ? 'Rendering…' : 'Generate Video'}
           </button>
-          {status === 'uploading' && (
-            <span className="text-sm text-neutral-400">Uploading…</span>
+          {busy && progress && (
+            <span className="text-xs text-neutral-500 font-mono truncate max-w-md">
+              {progress}
+            </span>
           )}
           {error && <span className="text-sm text-red-400">{error}</span>}
         </div>
@@ -132,10 +191,10 @@ export default function Page() {
           <section className="flex flex-col md:flex-row items-start gap-6 pt-2">
             <VideoPlayer videoUrl={videoUrl} aspect={aspect} />
             <GifPanel
-              jobId={jobId}
               gifUrl={gifUrl}
               aspect={aspect}
-              onGenerated={(url) => setGifUrl(url)}
+              renderGif={handleRenderGif}
+              disabled={busy}
             />
           </section>
         )}
@@ -156,7 +215,7 @@ export default function Page() {
         </section>
 
         <footer className="pt-8 pb-4 text-xs text-neutral-600 border-t border-neutral-900">
-          Output 1080×1920 H.264 · GIF via palettegen/paletteuse.
+          Everything runs locally via ffmpeg.wasm — your images never leave the browser.
         </footer>
       </div>
     </main>

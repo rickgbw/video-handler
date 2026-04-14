@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 
-export default function GifPanel({ jobId, onGenerated, gifUrl, aspect = { w: 9, h: 16 } }) {
+export default function GifPanel({ renderGif, onGenerated, gifUrl, aspect = { w: 9, h: 16 }, disabled }) {
   const [width, setWidth] = useState(540);
   const [fps, setFps] = useState(15);
   const [loading, setLoading] = useState(false);
@@ -12,14 +12,8 @@ export default function GifPanel({ jobId, onGenerated, gifUrl, aspect = { w: 9, 
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/render-gif', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobId, width, fps }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'gif failed');
-      onGenerated(data.gifUrl);
+      const url = await renderGif(width, fps);
+      if (onGenerated) onGenerated(url);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -57,7 +51,7 @@ export default function GifPanel({ jobId, onGenerated, gifUrl, aspect = { w: 9, 
       <button
         type="button"
         onClick={generate}
-        disabled={loading}
+        disabled={loading || disabled}
         className="w-full rounded-md bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 text-sm font-medium disabled:opacity-50"
       >
         {loading ? 'Rendering GIF…' : gifUrl ? 'Regenerate GIF' : 'Generate GIF'}

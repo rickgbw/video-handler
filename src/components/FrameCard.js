@@ -37,7 +37,7 @@ export default function FrameCard({
           style={{ aspectRatio: `${aspect.w} / ${aspect.h}` }}
         >
           <img
-            src={frame.thumbUrl}
+            src={frame.previewUrl}
             alt={frame.originalName}
             className="max-w-full max-h-full object-contain"
             draggable={false}
